@@ -28,6 +28,7 @@ import re
 import sys
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import simpledialog
 
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".timer_overlay.json")
@@ -90,7 +91,11 @@ class OverlayTimer:
         self.end_at = 0.0
         self.font_size = cfg.get("font_size", 48)
         self.color = cfg.get("color", "#FFFFFF")
+        self.text_color = self.color
+        self.opacity = min(1.0, max(0.3, cfg.get("opacity", 0.8)))
         self.flashing = False
+        self._layout_key = None
+        self._text_id = None
 
         self.root = tk.Tk()
         self.root.title("Timer")
@@ -106,18 +111,14 @@ class OverlayTimer:
             self.bg = "systemTransparent"
             self.root.config(bg=self.bg)
             self.root.wm_attributes("-transparent", True)
-        else:  # Linux: butuh compositor; fallback hitam semi-transparan
+        else:  # Linux: butuh compositor untuk transparansi
             self.bg = "#000000"
             self.root.config(bg=self.bg)
-            try:
-                self.root.attributes("-alpha", 0.75)
-            except tk.TclError:
-                pass
+        self.apply_opacity()  # transparansi panel hitam (berlaku di semua OS)
 
         families = ("Segoe UI Light", "Helvetica Neue Light", "SF Pro Display", "Helvetica")
         self.font_family = "Helvetica"
         try:
-            import tkinter.font as tkfont
             available = set(tkfont.families())
             for fam in families:
                 if fam in available:
@@ -126,11 +127,9 @@ class OverlayTimer:
         except Exception:
             pass
 
-        self.label = tk.Label(
-            self.root, text="", fg=self.color, bg=self.bg,
-            font=(self.font_family, self.font_size), padx=10, pady=0,
-        )
-        self.label.pack()
+        self.font = tkfont.Font(family=self.font_family, size=self.font_size)
+        self.canvas = tk.Canvas(self.root, bg=self.bg, highlightthickness=0, bd=0)
+        self.canvas.pack()
 
         pos = cfg.get("pos")
         if pos:
@@ -158,6 +157,10 @@ class OverlayTimer:
         for name, hexv in self.COLORS.items():
             color_menu.add_command(label=name, command=lambda h=hexv: self.set_color(h))
         self.menu.add_cascade(label="Warna teks", menu=color_menu)
+        opacity_menu = tk.Menu(self.menu, tearoff=0)
+        for label, val in (("40%", 0.4), ("55%", 0.55), ("70%", 0.7), ("85%", 0.85), ("100% (pekat)", 1.0)):
+            opacity_menu.add_command(label=label, command=lambda v=val: self.set_opacity(v))
+        self.menu.add_cascade(label="Kepekatan latar", menu=opacity_menu)
         preset = tk.Menu(self.menu, tearoff=0)
         for label, sec in (("30 detik", 30), ("1 menit", 60), ("5 menit", 300),
                            ("10 menit", 600), ("25 menit", 1500), ("1 jam", 3600)):
@@ -168,7 +171,7 @@ class OverlayTimer:
 
     def _bind_events(self):
         r = self.root
-        for w in (r, self.label):
+        for w in (r, self.canvas):
             w.bind("<ButtonPress-1>", self.on_press)
             w.bind("<B1-Motion>", self.on_drag)
             w.bind("<Double-Button-1>", lambda e: self.ask_time())
@@ -215,17 +218,78 @@ class OverlayTimer:
         self.refresh_font()
 
     def refresh_font(self):
-        self.label.config(font=(self.font_family, self.font_size))
+        self.font.configure(size=self.font_size)
+        self._layout_key = None  # paksa gambar ulang panel
+        self.update_display()
 
     def set_color(self, hexv):
         self.color = hexv
-        self.label.config(fg=hexv)
+        self.set_text_color(hexv)
+
+    def set_text_color(self, hexv):
+        self.text_color = hexv
+        if self._text_id is not None:
+            self.canvas.itemconfig(self._text_id, fill=hexv)
+
+    def apply_opacity(self):
+        try:
+            self.root.attributes("-alpha", self.opacity)
+        except tk.TclError:
+            pass
+
+    def set_opacity(self, value):
+        self.opacity = value
+        self.apply_opacity()
+
+    def _rrect(self, x1, y1, x2, y2, r, **kw):
+        """Persegi panjang dengan sudut membulat."""
+        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+               x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+               x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return self.canvas.create_polygon(pts, smooth=True, **kw)
+
+    def layout(self, text):
+        """Gambar panel hitam + bayangan lembut; hanya diulang jika ukuran berubah."""
+        key = (len(text), self.font_size)
+        if key == self._layout_key:
+            return
+        self._layout_key = key
+
+        ref = "".join("8" if ch.isdigit() else ch for ch in text)  # lebar tetap, tidak goyang
+        tw = self.font.measure(ref)
+        th = self.font.metrics("linespace")
+        sh = max(5, int(self.font_size * 0.16))   # tebal bayangan
+        dy = max(2, sh // 3)                       # bayangan sedikit turun ke bawah
+        px = int(self.font_size * 0.40)
+        py = int(self.font_size * 0.12)
+        radius = int(self.font_size * 0.22)
+
+        W = tw + 2 * px + 2 * sh
+        H = th + 2 * py + 2 * sh + dy
+        x1, y1, x2, y2 = sh, sh, W - sh, H - sh - dy
+
+        c = self.canvas
+        c.delete("all")
+        c.config(width=W, height=H)
+
+        # bayangan: lapisan luar lebih terang -> memudar keluar (hindari #010101 = warna kunci transparan)
+        for i in range(sh, 0, -1):
+            g = 2 + int(0x20 * i / sh)
+            self._rrect(x1 - i, y1 - i + dy, x2 + i, y2 + i + dy, radius + i,
+                        fill=f"#{g:02x}{g:02x}{g:02x}", outline="")
+        # panel hitam
+        self._rrect(x1, y1, x2, y2, radius, fill="#000000", outline="")
+        self._text_id = c.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=text,
+                                      font=self.font, fill=self.text_color, anchor="center")
 
     def update_display(self):
         t = max(self.remaining, 0.0)
         cs_total = int(t * 100)
         m, s, cs = cs_total // 6000, (cs_total // 100) % 60, cs_total % 100
-        self.label.config(text=f"{m:02d}:{s:02d}.{cs:02d}")
+        text = f"{m:02d}:{s:02d}.{cs:02d}"
+        self.layout(text)
+        self.canvas.itemconfig(self._text_id, text=text)
 
     # ---------- logika timer ----------
     def tick(self):
@@ -255,7 +319,7 @@ class OverlayTimer:
         self.running = False
         self.flashing = False
         self.remaining = float(self.total)
-        self.label.config(fg=self.color)
+        self.set_text_color(self.color)
         self.update_display()
 
     def set_time(self, seconds):
@@ -297,9 +361,9 @@ class OverlayTimer:
             return
         if n >= 24:  # ~12 detik lalu berhenti berkedip
             self.flashing = False
-            self.label.config(fg="#FF4B4B")
+            self.set_text_color("#FF4B4B")
             return
-        self.label.config(fg="#FF4B4B" if n % 2 == 0 else self.color)
+        self.set_text_color("#FF4B4B" if n % 2 == 0 else self.color)
         if n % 6 == 0:
             self.beep()
         self.root.after(500, lambda: self.flash(n + 1))
@@ -319,6 +383,7 @@ class OverlayTimer:
             "total": self.total,
             "font_size": self.font_size,
             "color": self.color,
+            "opacity": self.opacity,
             "pos": [self.root.winfo_x(), self.root.winfo_y()],
         })
         self.root.destroy()
